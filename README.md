@@ -467,7 +467,7 @@ This repository has been cleaned for public release by using:
 
 Developed by **Sanket Padhyal**.
 
-Personal website: [www.sanketpadhyal.world](https://www.sanketpadhyal.world)
+Personal website: [www.sanketpadhyal.in](https://www.sanketpadhyal.in)
 
 GitHub: [@sanketpadhyal](https://github.com/sanketpadhyal)
 
