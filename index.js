@@ -59,10 +59,10 @@ const config = {
   redisEnabled: process.env.REDIS_ENABLED === 'true',
   redisUrl: process.env.REDIS_URL || '',
   jwtSecret: process.env.JWT_SECRET || '',
-  jwtIssuer: process.env.JWT_ISSUER || 'iclora',
-  jwtAudience: process.env.JWT_AUDIENCE || 'iclora-web',
+  jwtIssuer: process.env.JWT_ISSUER || 'lumia',
+  jwtAudience: process.env.JWT_AUDIENCE || 'lumia-web',
   firebaseServiceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './service-account.json',
-  cookieName: process.env.COOKIE_NAME || 'iclora_session',
+  cookieName: process.env.COOKIE_NAME || 'lumia_session',
   cookieSecure: process.env.COOKIE_SECURE === 'true',
   cookieSameSite: process.env.COOKIE_SAME_SITE || 'lax',
   cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME || '',
@@ -350,7 +350,7 @@ async function requireSession(req, res, next) {
   try {
     const authHeader = req.get('authorization') || '';
     const bearerToken = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
-    const token = req.cookies?.[config.cookieName] || bearerToken;
+    const token = bearerToken || req.cookies?.[config.cookieName];
     if (!token) return res.status(401).json({ ok: false, error: 'Missing session' });
     if (!config.jwtSecret) return res.status(500).json({ ok: false, error: 'JWT_SECRET is missing' });
 
@@ -376,27 +376,37 @@ async function requireSession(req, res, next) {
         clearSessionCookie(req, res);
         return res.status(401).json({ ok: false, error: 'Session expired' });
       }
-      const fbAdmin = getFirebaseAdmin(config.firebaseServiceAccountPath);
-      const firebaseDecoded = await fbAdmin.auth().verifyIdToken(token);
-      decoded = {
-        uid: firebaseDecoded.uid,
-        email: firebaseDecoded.email || '',
-      };
+
+      try {
+        decoded = jwt.verify(token, config.jwtSecret);
+      } catch (innerError) {
+        if (innerError?.name === 'TokenExpiredError') {
+          clearSessionCookie(req, res);
+          return res.status(401).json({ ok: false, error: 'Session expired' });
+        }
+        const fbAdmin = getFirebaseAdmin(config.firebaseServiceAccountPath);
+        const firebaseDecoded = await fbAdmin.auth().verifyIdToken(token);
+        decoded = {
+          uid: firebaseDecoded.uid,
+          email: firebaseDecoded.email || '',
+        };
+      }
     }
 
     if (!decoded?.uid) return res.status(401).json({ ok: false, error: 'Invalid session' });
     let sessionId = getSessionIdFromDecoded(decoded);
     if (!sessionId) {
       sessionId = getLegacySessionId(token);
-      const wasLoggedOut = await hasExpiredSessionActivity({
-        config,
-        uid: decoded.uid,
-        sessionId,
-      });
-      if (wasLoggedOut) {
-        clearSessionCookie(req, res);
-        return res.status(401).json({ ok: false, error: 'Session expired' });
-      }
+    }
+
+    const wasLoggedOut = await hasExpiredSessionActivity({
+      config,
+      uid: decoded.uid,
+      sessionId,
+    });
+    if (wasLoggedOut) {
+      clearSessionCookie(req, res);
+      return res.status(401).json({ ok: false, error: 'Session expired' });
     }
 
     const active = await ensureSessionIsActive({
@@ -404,24 +414,21 @@ async function requireSession(req, res, next) {
       uid: decoded.uid,
       sessionId,
     });
-    if (!active && sessionId.startsWith('legacy-')) {
+    if (!active) {
       await recordLoginActivity({
         config,
         uid: decoded.uid,
         email: decoded.email || '',
         sessionId,
-        provider: 'legacy',
+        provider: 'recovered',
         req,
         expiresAtMs: decoded.exp ? decoded.exp * 1000 : Date.now() + SESSION_MAX_AGE_MS,
-      });
-    } else if (!active) {
-      clearSessionCookie(req, res);
-      return res.status(401).json({ ok: false, error: 'Session expired' });
+      }).catch(() => {});
     }
 
     req.session = { uid: decoded.uid, email: decoded.email || '', sessionId };
     return next();
-  } catch {
+  } catch (err) {
     return res.status(401).json({ ok: false, error: 'Invalid session' });
   }
 }
@@ -608,132 +615,143 @@ async function readDeletedPhotosStorage(userRef, uid) {
 
 async function readSupabaseNotesStorage(uid, { exact = false } = {}) {
   if (!useSupabaseForNotes) return null;
-  const sb = getSupabaseAdmin();
-  if (!exact) {
-    const metaResult = await sb
-      .from('notes_meta')
-      .select('active,storage_used')
-      .eq('user_id', uid)
-      .maybeSingle();
-    if (metaResult.error) throw metaResult.error;
-    if (metaResult.data) {
-      return {
-        active: metaResult.data.active === true,
-        storageUsed: normalizeStorageMb(metaResult.data.storage_used),
-      };
+  try {
+    const sb = getSupabaseAdmin();
+    if (!exact) {
+      const metaResult = await sb
+        .from('notes_meta')
+        .select('active,storage_used')
+        .eq('user_id', uid)
+        .maybeSingle();
+      if (!metaResult.error && metaResult.data) {
+        return {
+          active: metaResult.data.active === true,
+          storageUsed: normalizeStorageMb(metaResult.data.storage_used),
+        };
+      }
     }
-  }
 
-  const [metaResult, storageResult] = await Promise.all([
-    sb.from('notes_meta').select('active').eq('user_id', uid).maybeSingle(),
-    sb.from('notes_items').select('title,content,storage_used').eq('user_id', uid),
-  ]);
-  if (metaResult.error) throw metaResult.error;
-  if (storageResult.error) throw storageResult.error;
-  const storageUsed = normalizeStorageMb((storageResult.data || []).reduce((total, row) => total + noteRowStorageMb(row), 0));
-  if (metaResult.data?.active === true) {
-    sb.from('notes_meta').update({
-      storage_used: storageUsed,
-      updated_at: new Date().toISOString(),
-    }).eq('user_id', uid).then(() => {}, () => {});
+    const [metaResult, storageResult] = await Promise.all([
+      sb.from('notes_meta').select('active').eq('user_id', uid).maybeSingle(),
+      sb.from('notes_items').select('title,content,storage_used').eq('user_id', uid),
+    ]);
+    if (metaResult.error || storageResult.error) return { active: false, storageUsed: 0 };
+    const storageUsed = normalizeStorageMb((storageResult.data || []).reduce((total, row) => total + noteRowStorageMb(row), 0));
+    if (metaResult.data?.active === true) {
+      sb.from('notes_meta').update({
+        storage_used: storageUsed,
+        updated_at: new Date().toISOString(),
+      }).eq('user_id', uid).then(() => {}, () => {});
+    }
+    return {
+      active: metaResult.data?.active === true,
+      storageUsed,
+    };
+  } catch {
+    return { active: false, storageUsed: 0 };
   }
-  return {
-    active: metaResult.data?.active === true,
-    storageUsed,
-  };
 }
 
 async function readSupabaseContactsStorage(uid, { exact = false } = {}) {
   if (!useSupabaseForContacts) return null;
-  const sb = getSupabaseAdmin();
-  if (!exact) {
-    const metaResult = await sb
-      .from('contacts_meta')
-      .select('active,storage_used')
-      .eq('user_id', uid)
-      .maybeSingle();
-    if (metaResult.error) throw metaResult.error;
-    if (metaResult.data) {
-      return {
-        active: metaResult.data.active === true,
-        storageUsed: normalizeStorageMb(metaResult.data.storage_used),
-      };
+  try {
+    const sb = getSupabaseAdmin();
+    if (!exact) {
+      const metaResult = await sb
+        .from('contacts_meta')
+        .select('active,storage_used')
+        .eq('user_id', uid)
+        .maybeSingle();
+      if (!metaResult.error && metaResult.data) {
+        return {
+          active: metaResult.data.active === true,
+          storageUsed: normalizeStorageMb(metaResult.data.storage_used),
+        };
+      }
     }
-  }
 
-  const [metaResult, storageResult] = await Promise.all([
-    sb.from('contacts_meta').select('active').eq('user_id', uid).maybeSingle(),
-    sb
-      .from('contacts_items')
-      .select('display_name,first_name,last_name,company,phone,extra_phones,email,birthday,address,note,storage_used,photo_storage_used')
-      .eq('user_id', uid),
-  ]);
-  if (metaResult.error) throw metaResult.error;
-  if (storageResult.error) throw storageResult.error;
-  const storageUsed = normalizeStorageMb((storageResult.data || []).reduce((total, row) => total + contactRowStorageMb(row), 0));
-  if (metaResult.data?.active === true) {
-    sb.from('contacts_meta').update({
-      storage_used: storageUsed,
-      updated_at: new Date().toISOString(),
-    }).eq('user_id', uid).then(() => {}, () => {});
+    const [metaResult, storageResult] = await Promise.all([
+      sb.from('contacts_meta').select('active').eq('user_id', uid).maybeSingle(),
+      sb
+        .from('contacts_items')
+        .select('display_name,first_name,last_name,company,phone,extra_phones,email,birthday,address,note,storage_used,photo_storage_used')
+        .eq('user_id', uid),
+    ]);
+    if (metaResult.error || storageResult.error) return { active: false, storageUsed: 0 };
+    const storageUsed = normalizeStorageMb((storageResult.data || []).reduce((total, row) => total + contactRowStorageMb(row), 0));
+    if (metaResult.data?.active === true) {
+      sb.from('contacts_meta').update({
+        storage_used: storageUsed,
+        updated_at: new Date().toISOString(),
+      }).eq('user_id', uid).then(() => {}, () => {});
+    }
+    return {
+      active: metaResult.data?.active === true,
+      storageUsed,
+    };
+  } catch {
+    return { active: false, storageUsed: 0 };
   }
-  return {
-    active: metaResult.data?.active === true,
-    storageUsed,
-  };
 }
 
 async function readAppStorageBreakdown(userRef, uid, user = {}, { exact = false } = {}) {
-  const [snapshots, supabaseNotes, supabaseContacts] = await Promise.all([
-    Promise.all(APP_STORAGE_SOURCES.map((app) => userRef.collection(app.key).doc('meta').get())),
-    readSupabaseNotesStorage(uid, { exact }),
-    readSupabaseContactsStorage(uid, { exact }),
-  ]);
-  const photosMeta = snapshots[0].exists ? snapshots[0].data() || {} : {};
-  const deletedPhotosStorage = !exact && typeof photosMeta.deletedStorageUsed === 'number'
-    ? normalizeStorageMb(photosMeta.deletedStorageUsed)
-    : await readDeletedPhotosStorage(userRef, uid);
+  try {
+    const [snapshots, supabaseNotes, supabaseContacts] = await Promise.all([
+      Promise.all(APP_STORAGE_SOURCES.map((app) => userRef.collection(app.key).doc('meta').get().catch(() => ({ exists: false, data: () => ({}) })))),
+      readSupabaseNotesStorage(uid, { exact }).catch(() => null),
+      readSupabaseContactsStorage(uid, { exact }).catch(() => null),
+    ]);
+    const photosMeta = snapshots[0]?.exists ? snapshots[0].data() || {} : {};
+    const deletedPhotosStorage = !exact && typeof photosMeta.deletedStorageUsed === 'number'
+      ? normalizeStorageMb(photosMeta.deletedStorageUsed)
+      : await readDeletedPhotosStorage(userRef, uid).catch(() => 0);
 
-  const breakdown = APP_STORAGE_SOURCES.map((app, index) => {
-    const data = snapshots[index].exists ? snapshots[index].data() || {} : {};
-    if (app.key === 'notes' && supabaseNotes) {
+    const breakdown = APP_STORAGE_SOURCES.map((app, index) => {
+      const data = snapshots[index]?.exists ? snapshots[index].data() || {} : {};
+      if (app.key === 'notes' && supabaseNotes) {
+        return {
+          key: app.key,
+          label: app.label,
+          color: app.color,
+          active: supabaseNotes.active,
+          storageUsed: supabaseNotes.storageUsed,
+        };
+      }
+      if (app.key === 'contacts' && supabaseContacts) {
+        return {
+          key: app.key,
+          label: app.label,
+          color: app.color,
+          active: supabaseContacts.active,
+          storageUsed: supabaseContacts.storageUsed,
+        };
+      }
       return {
         key: app.key,
         label: app.label,
         color: app.color,
-        active: supabaseNotes.active,
-        storageUsed: supabaseNotes.storageUsed,
+        active: data.active === true,
+        storageUsed: Number((normalizeStorageMb(data.storageUsed) + (app.key === 'photos' ? deletedPhotosStorage : 0)).toFixed(4)),
       };
-    }
-    if (app.key === 'contacts' && supabaseContacts) {
-      return {
-        key: app.key,
-        label: app.label,
-        color: app.color,
-        active: supabaseContacts.active,
-        storageUsed: supabaseContacts.storageUsed,
-      };
-    }
+    });
+
+    const profilePhotoStorageMb = readProfilePhotoStorageMb(user);
+    const nextBreakdown = breakdown.map((app) => (
+      app.key === 'photos'
+        ? { ...app, storageUsed: Number((app.storageUsed + profilePhotoStorageMb).toFixed(4)) }
+        : app
+    ));
+
     return {
-      key: app.key,
-      label: app.label,
-      color: app.color,
-      active: data.active === true,
-      storageUsed: Number((normalizeStorageMb(data.storageUsed) + (app.key === 'photos' ? deletedPhotosStorage : 0)).toFixed(4)),
+      storageused: Number(nextBreakdown.reduce((total, app) => total + app.storageUsed, 0).toFixed(4)),
+      storageBreakdown: nextBreakdown,
     };
-  });
-
-  const profilePhotoStorageMb = readProfilePhotoStorageMb(user);
-  const nextBreakdown = breakdown.map((app) => (
-    app.key === 'photos'
-      ? { ...app, storageUsed: Number((app.storageUsed + profilePhotoStorageMb).toFixed(4)) }
-      : app
-  ));
-
-  return {
-    storageused: Number(nextBreakdown.reduce((total, app) => total + app.storageUsed, 0).toFixed(4)),
-    storageBreakdown: nextBreakdown,
-  };
+  } catch {
+    return {
+      storageused: 0,
+      storageBreakdown: APP_STORAGE_SOURCES.map((app) => ({ key: app.key, label: app.label, color: app.color, active: false, storageUsed: 0 })),
+    };
+  }
 }
 
 app.get('/auth/me', requireSession, async (req, res) => {

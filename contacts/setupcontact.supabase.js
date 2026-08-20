@@ -1,8 +1,8 @@
 import express from 'express';
 import { getSupabaseAdmin } from '../supabase/client.js';
 
-const ICLORA_SUPPORT_EMAIL = '';
-const ICLORA_SUPPORT_PHONE = '';
+const ICLORA_SUPPORT_EMAIL = 'icloraofficial@gmail.com';
+const ICLORA_SUPPORT_PHONE = '8975659255';
 
 function getFirstName(value, fallback = 'there') {
   const text = typeof value === 'string' ? value.trim() : '';

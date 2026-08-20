@@ -111,24 +111,28 @@ function isMissingSupabaseRelation(error) {
 
 async function readSupabaseContactPhotoPublicIds(uid) {
   if (!hasSupabaseConfig()) return [];
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb
-    .from('contacts_items')
-    .select('photo_public_id')
-    .eq('user_id', uid);
-  if (error) {
-    if (isMissingSupabaseRelation(error)) return [];
-    throw error;
+  try {
+    const sb = getSupabaseAdmin();
+    const { data, error } = await sb
+      .from('contacts_items')
+      .select('photo_public_id')
+      .eq('user_id', uid);
+    if (error) return [];
+    return uniqueStrings((data || []).map((row) => row?.photo_public_id));
+  } catch {
+    return [];
   }
-  return uniqueStrings((data || []).map((row) => row?.photo_public_id));
 }
 
 async function deleteSupabaseUserData(uid) {
   if (!hasSupabaseConfig()) return;
-  const sb = getSupabaseAdmin();
-  for (const table of SUPABASE_USER_TABLES) {
-    const { error } = await sb.from(table).delete().eq('user_id', uid);
-    if (error && !isMissingSupabaseRelation(error)) throw error;
+  try {
+    const sb = getSupabaseAdmin();
+    for (const table of SUPABASE_USER_TABLES) {
+      await sb.from(table).delete().eq('user_id', uid).catch(() => {});
+    }
+  } catch {
+    // Account deletion should not fail if external database is unavailable.
   }
 }
 
