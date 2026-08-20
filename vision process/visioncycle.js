@@ -5,7 +5,7 @@ const PRIVATE_UPLOAD_TYPE = 'authenticated';
 const DEFAULT_INTERVAL_MS = 30 * 1000;
 const DEFAULT_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_USER_SCAN_LIMIT = 100;
-const DEFAULT_VISION_API_URL = '';
+const DEFAULT_VISION_API_URL = 'https://florence-backend-production-3220.up.railway.app';
 
 function cleanText(value, fallback = '') {
   const text = typeof value === 'string' ? value.trim() : '';

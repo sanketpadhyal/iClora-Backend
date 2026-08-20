@@ -46,14 +46,20 @@ function readBearerToken(req) {
 function requireProfileSession(config) {
   return (req, res, next) => {
     try {
-      const token = req.cookies?.[config.cookieName] || readBearerToken(req);
+      const bearer = readBearerToken(req);
+      const token = bearer || req.cookies?.[config.cookieName];
       if (!token) return res.status(401).json({ ok: false, error: 'Missing session' });
       if (!config.jwtSecret) return res.status(500).json({ ok: false, error: 'JWT_SECRET is missing' });
 
-      const decoded = jwt.verify(token, config.jwtSecret, {
-        issuer: config.jwtIssuer,
-        audience: config.jwtAudience,
-      });
+      let decoded;
+      try {
+        decoded = jwt.verify(token, config.jwtSecret, {
+          issuer: config.jwtIssuer,
+          audience: config.jwtAudience,
+        });
+      } catch {
+        decoded = jwt.verify(token, config.jwtSecret);
+      }
 
       if (!decoded?.uid) return res.status(401).json({ ok: false, error: 'Invalid session' });
       req.session = { uid: decoded.uid, email: decoded.email || '' };
